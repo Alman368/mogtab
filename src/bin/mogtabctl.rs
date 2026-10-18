@@ -1,35 +1,7 @@
+use mogtab::ipc::{self, Direction, IpcCommand, OpenRequest, Profile};
 use std::env;
-use std::fs;
-use std::io::Write;
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-use std::process::{Command, ExitCode};
-use std::thread;
-use std::time::Duration;
-
-const SOCKET_NAME: &str = "mogtab.sock";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Profile {
-    Alt,
-    Super,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Direction {
-    Next,
-    Prev,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IpcCommand {
-    Open {
-        profile: Profile,
-        direction: Direction,
-    },
-    Close,
-    Cancel,
-}
+use std::ffi::OsString;
+use std::process::ExitCode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParsedArgs {
@@ -53,15 +25,15 @@ fn run() -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     };
 
-    match send_ipc(command) {
-        Ok(()) => Ok(ExitCode::SUCCESS),
-        Err(err) if matches!(command, IpcCommand::Open { .. }) => {
-            send_after_start(command, err).map(|()| ExitCode::SUCCESS)
+    match command {
+        IpcCommand::Open(_) => {
+            ipc::send_or_start(command, &daemon_path()).map(|()| ExitCode::SUCCESS)
         }
-        Err(_) if matches!(command, IpcCommand::Close | IpcCommand::Cancel) => {
+        // Nothing to close when the daemon is not running.
+        IpcCommand::Close | IpcCommand::Cancel => {
+            let _ = ipc::send(command);
             Ok(ExitCode::SUCCESS)
         }
-        Err(err) => Err(err),
     }
 }
 
@@ -100,7 +72,10 @@ fn parse_open_args(args: impl IntoIterator<Item = String>) -> Result<ParsedArgs,
         }
     }
 
-    Ok(ParsedArgs::Command(IpcCommand::Open { profile, direction }))
+    Ok(ParsedArgs::Command(IpcCommand::Open(OpenRequest {
+        profile,
+        direction,
+    })))
 }
 
 fn parse_profile(value: &str) -> Result<Profile, String> {
@@ -119,83 +94,14 @@ fn parse_direction(value: &str) -> Result<Direction, String> {
     }
 }
 
-fn send_after_start(command: IpcCommand, first_err: String) -> Result<(), String> {
-    start_daemon()?;
-
-    for _ in 0..20 {
-        thread::sleep(Duration::from_millis(25));
-        if send_ipc(command).is_ok() {
-            return Ok(());
-        }
-    }
-
-    Err(format!(
-        "daemon was not reachable after auto-start: {first_err}"
-    ))
-}
-
-fn start_daemon() -> Result<(), String> {
-    let daemon = daemon_path();
-    Command::new(&daemon)
-        .arg("run")
-        .spawn()
-        .map(|_| ())
-        .map_err(|err| format!("failed to auto-start {daemon}: {err}"))
-}
-
-fn daemon_path() -> String {
-    let Ok(current_exe) = env::current_exe() else {
-        return "mogtab".to_string();
-    };
-
-    let Some(parent) = current_exe.parent() else {
-        return "mogtab".to_string();
-    };
-
-    let sibling = parent.join("mogtab");
-    if fs::metadata(&sibling).is_ok() {
-        sibling.to_string_lossy().into_owned()
-    } else {
-        "mogtab".to_string()
-    }
-}
-
-fn send_ipc(command: IpcCommand) -> Result<(), String> {
-    let mut stream = UnixStream::connect(socket_path())
-        .map_err(|err| format!("switcher daemon is not running: {err}"))?;
-    stream
-        .write_all(ipc_payload(command).as_bytes())
-        .map_err(|err| format!("failed to send IPC command: {err}"))
-}
-
-fn ipc_payload(command: IpcCommand) -> &'static str {
-    match command {
-        IpcCommand::Open {
-            profile: Profile::Alt,
-            direction: Direction::Next,
-        } => "open alt next\n",
-        IpcCommand::Open {
-            profile: Profile::Alt,
-            direction: Direction::Prev,
-        } => "open alt prev\n",
-        IpcCommand::Open {
-            profile: Profile::Super,
-            direction: Direction::Next,
-        } => "open super next\n",
-        IpcCommand::Open {
-            profile: Profile::Super,
-            direction: Direction::Prev,
-        } => "open super prev\n",
-        IpcCommand::Close => "close\n",
-        IpcCommand::Cancel => "cancel\n",
-    }
-}
-
-fn socket_path() -> PathBuf {
-    env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir)
-        .join(SOCKET_NAME)
+/// The `mogtab` binary installed next to this one, else `mogtab` from `PATH`.
+fn daemon_path() -> OsString {
+    env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("mogtab")))
+        .filter(|sibling| sibling.is_file())
+        .map(OsString::from)
+        .unwrap_or_else(|| OsString::from("mogtab"))
 }
 
 fn help_text() -> String {
@@ -214,10 +120,10 @@ mod tests {
     fn defaults_to_alt_next() {
         assert_eq!(
             parse_args(["open"].into_iter().map(String::from)),
-            Ok(ParsedArgs::Command(IpcCommand::Open {
+            Ok(ParsedArgs::Command(IpcCommand::Open(OpenRequest {
                 profile: Profile::Alt,
                 direction: Direction::Next,
-            }))
+            })))
         );
     }
 
@@ -229,10 +135,10 @@ mod tests {
                     .into_iter()
                     .map(String::from),
             ),
-            Ok(ParsedArgs::Command(IpcCommand::Open {
+            Ok(ParsedArgs::Command(IpcCommand::Open(OpenRequest {
                 profile: Profile::Super,
                 direction: Direction::Prev,
-            }))
+            })))
         );
     }
 

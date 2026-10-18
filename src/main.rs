@@ -1,28 +1,31 @@
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use gtk::gdk;
 use gtk::glib::{self, ControlFlow, Propagation};
 use gtk::pango;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use gtk4_layer_shell::{KeyboardMode, Layer, LayerShell};
+use mogtab::ipc::{self, Direction, IpcCommand, OpenRequest, Profile};
 use serde::Deserialize;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const APP_ID: &str = "dev.alman.MogTab";
 const NAMESPACE: &str = "mogtab";
-const SOCKET_NAME: &str = "mogtab.sock";
+const IPC_READ_TIMEOUT: Duration = Duration::from_secs(1);
+const IPC_MAX_PAYLOAD: u64 = 64;
+const DESKTOP_INDEX_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const INITIAL_TAB_SUPPRESSION_GRACE: Duration = Duration::from_millis(180);
 const MODIFIER_STATE_SETTLE_GRACE: Duration = Duration::from_millis(45);
 const MODIFIER_RELEASE_CONFIRM_SAMPLES: u8 = 2;
@@ -118,36 +121,11 @@ enum CliCommand {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Profile {
-    Alt,
-    Super,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Direction {
-    Next,
-    Prev,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum IpcCommand {
-    Open(OpenRequest),
-    Close,
-    Cancel,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiUpdate {
     None,
     RenderAndPresent,
     Selection,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct OpenRequest {
-    profile: Profile,
-    direction: Direction,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -168,8 +146,7 @@ enum Scope {
     CurrentMonitor,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProfileSettings {
     target: Target,
     scope: Scope,
@@ -179,11 +156,55 @@ struct ProfileSettings {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(from = "RawAppConfig")]
 struct AppConfig {
     alt: ProfileSettings,
-    #[serde(rename = "super")]
     super_profile: ProfileSettings,
+}
+
+/// Config as written, with every field optional, so a partial section keeps
+/// the defaults of its own profile instead of generic ones.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawAppConfig {
+    alt: RawProfileSettings,
+    #[serde(rename = "super")]
+    super_profile: RawProfileSettings,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawProfileSettings {
+    target: Option<Target>,
+    scope: Option<Scope>,
+    same_class: Option<bool>,
+    include_special_workspaces: Option<bool>,
+    include_empty_workspaces: Option<bool>,
+}
+
+impl RawProfileSettings {
+    fn or_defaults(self, defaults: ProfileSettings) -> ProfileSettings {
+        ProfileSettings {
+            target: self.target.unwrap_or(defaults.target),
+            scope: self.scope.unwrap_or(defaults.scope),
+            same_class: self.same_class.unwrap_or(defaults.same_class),
+            include_special_workspaces: self
+                .include_special_workspaces
+                .unwrap_or(defaults.include_special_workspaces),
+            include_empty_workspaces: self
+                .include_empty_workspaces
+                .unwrap_or(defaults.include_empty_workspaces),
+        }
+    }
+}
+
+impl From<RawAppConfig> for AppConfig {
+    fn from(raw: RawAppConfig) -> Self {
+        let defaults = Self::default();
+        Self {
+            alt: raw.alt.or_defaults(defaults.alt),
+            super_profile: raw.super_profile.or_defaults(defaults.super_profile),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -214,6 +235,8 @@ struct HyprClient {
     initial_class: String,
     #[serde(default)]
     title: String,
+    #[serde(default)]
+    pid: i64,
     #[serde(default, rename = "focusHistoryID")]
     focus_history_id: Option<i64>,
     #[serde(default)]
@@ -263,6 +286,9 @@ struct WindowInfo {
     address: String,
     title: String,
     wm_class: String,
+    exe: String,
+    app_name: String,
+    desktop_icon: String,
     workspace_id: i64,
     workspace_name: String,
     monitor: i64,
@@ -338,18 +364,6 @@ fn default_true() -> bool {
     true
 }
 
-impl Default for ProfileSettings {
-    fn default() -> Self {
-        Self {
-            target: Target::Windows,
-            scope: Scope::CurrentMonitor,
-            same_class: false,
-            include_special_workspaces: false,
-            include_empty_workspaces: false,
-        }
-    }
-}
-
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -376,21 +390,38 @@ fn main() -> Result<()> {
     match cli.command {
         CliCommand::Run => run_daemon(),
         CliCommand::Open { profile, direction } => {
-            send_or_start(IpcCommand::Open(OpenRequest { profile, direction }), true)?;
-            Ok(())
+            let daemon = env::current_exe().context("failed to resolve current executable")?;
+            ipc::send_or_start(
+                IpcCommand::Open(OpenRequest { profile, direction }),
+                daemon.as_os_str(),
+            )
+            .map_err(anyhow::Error::msg)
         }
         CliCommand::Close => {
-            let _ = send_ipc(IpcCommand::Close);
+            let _ = ipc::send(IpcCommand::Close);
             Ok(())
         }
         CliCommand::Cancel => {
-            let _ = send_ipc(IpcCommand::Cancel);
+            let _ = ipc::send(IpcCommand::Cancel);
             Ok(())
         }
         CliCommand::List { profile } => {
             let config = load_config();
+            // Initialize GTK when possible so icons are checked against the theme.
+            if gtk::init().is_ok() {
+                add_icon_search_paths();
+            }
             for item in collect_items(config.profile(profile))? {
-                println!("{}  [{}]", item.display_name(), item.meta_text());
+                let icon = match item.icon() {
+                    AppIcon::Named(name) => name,
+                    AppIcon::File(path) => path.display().to_string(),
+                };
+                println!(
+                    "{}  [{}]  icon: {}",
+                    item.display_name(),
+                    item.meta_text(),
+                    icon
+                );
             }
             Ok(())
         }
@@ -398,12 +429,21 @@ fn main() -> Result<()> {
 }
 
 fn run_daemon() -> Result<()> {
-    let app = gtk::Application::builder().application_id(APP_ID).build();
+    // NON_UNIQUE: with D-Bus uniqueness a second `mogtab run` would re-run
+    // `activate` inside the running daemon, whose socket bind then fails and
+    // quits it. The IPC socket already guarantees a single daemon.
+    let app = gtk::Application::builder()
+        .application_id(APP_ID)
+        .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+        .build();
 
     app.connect_activate(|app| {
         // This is a resident hidden-window app; keep it alive between switcher opens.
         std::mem::forget(app.hold());
         install_css();
+        add_icon_search_paths();
+        // Warm the desktop entry index so the first switcher open stays fast.
+        thread::spawn(desktop_index);
 
         let window = gtk::ApplicationWindow::builder()
             .application(app)
@@ -913,7 +953,10 @@ fn item_card(
     });
     card.add_controller(click);
 
-    let icon = gtk::Image::from_icon_name(item.icon_name());
+    let icon = match item.icon() {
+        AppIcon::Named(name) => gtk::Image::from_icon_name(&name),
+        AppIcon::File(path) => gtk::Image::from_file(path),
+    };
     icon.add_css_class("switcher-icon");
     icon.set_pixel_size(52);
     icon.set_halign(gtk::Align::Center);
@@ -974,7 +1017,7 @@ impl SwitchItem {
 
     fn app_label(&self) -> String {
         match self {
-            Self::Window(window) => app_display_name(&window.wm_class).to_string(),
+            Self::Window(window) => window.app_name.clone(),
             Self::Workspace(workspace) => format!("Workspace {}", workspace.name),
             Self::Monitor(_) => "Monitor".to_string(),
         }
@@ -1001,11 +1044,11 @@ impl SwitchItem {
         }
     }
 
-    fn icon_name(&self) -> &'static str {
+    fn icon(&self) -> AppIcon {
         match self {
-            Self::Window(window) => icon_name(&window.wm_class),
-            Self::Workspace(_) => "view-grid-symbolic",
-            Self::Monitor(_) => "video-display-symbolic",
+            Self::Window(window) => window_icon(window),
+            Self::Workspace(_) => AppIcon::Named("view-grid-symbolic".to_string()),
+            Self::Monitor(_) => AppIcon::Named("video-display-symbolic".to_string()),
         }
     }
 }
@@ -1015,13 +1058,13 @@ impl WindowInfo {
         if !self.title.trim().is_empty() && !self.wm_class.trim().is_empty() {
             format!(
                 "{}: {}",
-                app_display_name(&self.wm_class),
+                self.app_name.clone(),
                 clean_display_title(&self.title)
             )
         } else if !self.title.trim().is_empty() {
             clean_display_title(&self.title)
         } else if !self.wm_class.trim().is_empty() {
-            app_display_name(&self.wm_class).to_string()
+            self.app_name.clone()
         } else {
             self.address.clone()
         }
@@ -1031,7 +1074,7 @@ impl WindowInfo {
         if !self.title.trim().is_empty() {
             clean_display_title(&self.title)
         } else if !self.wm_class.trim().is_empty() {
-            app_display_name(&self.wm_class).to_string()
+            self.app_name.clone()
         } else {
             self.address.clone()
         }
@@ -1069,43 +1112,496 @@ impl MonitorInfo {
     }
 }
 
-fn icon_name(class_name: &str) -> &'static str {
-    let normalized = class_name.to_ascii_lowercase();
-    match normalized.as_str() {
-        "zen" => "zen-browser",
-        "firefox" => "firefox",
-        "chromium" => "chromium",
-        "google-chrome" | "chrome" => "google-chrome",
-        "code" | "visual studio code" => "visual-studio-code",
-        "dev.zed.zed" | "zed" => "zed",
-        "alacritty" => "Alacritty",
-        "kitty" => "kitty",
-        "org.gnome.nautilus" | "nautilus" => "org.gnome.Nautilus",
-        "signal" | "signal-desktop" => "signal-desktop",
-        "spotify" => "spotify",
-        "obsidian" => "obsidian",
-        _ => "application-x-executable",
+enum AppIcon {
+    Named(String),
+    File(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DesktopEntry {
+    id: String,
+    name: String,
+    icon: String,
+    wm_class: String,
+    exec: String,
+    no_display: bool,
+}
+
+impl DesktopEntry {
+    /// Ranks entries competing for the same fuzzy key, so the result does not
+    /// depend on directory iteration order: an entry whose id is the key wins,
+    /// then entries shown in menus, then the shortest id.
+    fn rank(
+        &self,
+        key: &str,
+    ) -> (
+        bool,
+        bool,
+        std::cmp::Reverse<usize>,
+        std::cmp::Reverse<&str>,
+    ) {
+        (
+            self.id == key,
+            !self.no_display,
+            std::cmp::Reverse(self.id.len()),
+            std::cmp::Reverse(self.id.as_str()),
+        )
     }
 }
 
-fn app_display_name(class_name: &str) -> &'static str {
-    let normalized = class_name.to_ascii_lowercase();
-    match normalized.as_str() {
-        "zen" => "Zen Browser",
-        "firefox" => "Firefox",
-        "chromium" => "Chromium",
-        "google-chrome" | "chrome" => "Chrome",
-        "chrome-github.com__-default" => "GitHub",
-        "code" | "visual studio code" => "VS Code",
-        "dev.zed.zed" | "zed" => "Zed",
-        "alacritty" => "Alacritty",
-        "kitty" => "Kitty",
-        "org.gnome.nautilus" | "nautilus" => "Files",
-        "signal" | "signal-desktop" => "Signal",
-        "spotify" => "Spotify",
-        "obsidian" => "Obsidian",
-        _ => "Application",
+#[derive(Default)]
+struct DesktopIndex {
+    seen_ids: HashSet<String>,
+    by_wm_class: HashMap<String, DesktopEntry>,
+    by_id: HashMap<String, DesktopEntry>,
+    by_id_tail: HashMap<String, DesktopEntry>,
+    by_exec: HashMap<String, DesktopEntry>,
+    by_name: HashMap<String, DesktopEntry>,
+}
+
+impl DesktopIndex {
+    fn load(dirs: &[PathBuf]) -> Self {
+        let locale = locale_names();
+        let mut index = Self::default();
+        for dir in dirs {
+            index.scan_dir(dir, "", &locale);
+        }
+        index
     }
+
+    fn scan_dir(&mut self, dir: &Path, id_prefix: &str, locale: &[String]) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            if path.is_dir() {
+                self.scan_dir(&path, &format!("{id_prefix}{file_name}-"), locale);
+                continue;
+            }
+
+            let Some(stem) = file_name.strip_suffix(".desktop") else {
+                continue;
+            };
+            // The first data dir that has a desktop id owns it, even when that
+            // file hides the entry, so user overrides mask system files.
+            let id = format!("{id_prefix}{stem}").to_ascii_lowercase();
+            if !self.seen_ids.insert(id.clone()) {
+                continue;
+            }
+            if let Some(desktop_entry) = fs::read_to_string(&path)
+                .ok()
+                .and_then(|contents| parse_desktop_entry(&id, &contents, locale))
+            {
+                self.insert(desktop_entry);
+            }
+        }
+    }
+
+    fn insert(&mut self, entry: DesktopEntry) {
+        let keyed = [
+            (&mut self.by_wm_class, entry.wm_class.to_ascii_lowercase()),
+            (&mut self.by_id_tail, class_tail(&entry.id)),
+            (&mut self.by_exec, entry.exec.to_ascii_lowercase()),
+            (&mut self.by_name, entry.name.to_ascii_lowercase()),
+        ];
+        for (map, key) in keyed {
+            if key.is_empty() {
+                continue;
+            }
+            match map.get(&key) {
+                Some(current) if current.rank(&key) >= entry.rank(&key) => {}
+                _ => {
+                    map.insert(key, entry.clone());
+                }
+            }
+        }
+        self.by_id.insert(entry.id.clone(), entry);
+    }
+
+    fn lookup(&self, class_name: &str) -> Option<&DesktopEntry> {
+        let normalized = class_name.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return None;
+        }
+        let tail = class_tail(&normalized);
+
+        self.by_wm_class
+            .get(&normalized)
+            .or_else(|| self.by_id.get(&normalized))
+            .or_else(|| self.by_id_tail.get(&normalized))
+            .or_else(|| self.by_exec.get(&normalized))
+            .or_else(|| self.by_name.get(&normalized))
+            .or_else(|| self.by_wm_class.get(&tail))
+            .or_else(|| self.by_id.get(&tail))
+            .or_else(|| self.by_exec.get(&tail))
+            .or_else(|| self.by_name.get(&tail))
+    }
+}
+
+/// Last segment of a reverse-DNS name: `dev.zed.Zed` -> `zed`.
+fn class_tail(name: &str) -> String {
+    name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase()
+}
+
+/// Modification times of the applications dirs, used to detect changes.
+type DirsSignature = Vec<Option<SystemTime>>;
+
+struct IndexCache {
+    signature: DirsSignature,
+    index: Arc<DesktopIndex>,
+    checked_at: Instant,
+    reloading: bool,
+}
+
+static DESKTOP_INDEX: Mutex<Option<IndexCache>> = Mutex::new(None);
+
+fn dirs_signature(dirs: &[PathBuf]) -> DirsSignature {
+    dirs.iter()
+        .map(|dir| fs::metadata(dir).and_then(|meta| meta.modified()).ok())
+        .collect()
+}
+
+/// Shared desktop index. Only the first call loads it synchronously; after that
+/// the applications dirs are checked at most once per interval and, when they
+/// changed (an app was installed or removed), the index is rebuilt on a
+/// background thread while callers keep using the previous one.
+fn desktop_index() -> Arc<DesktopIndex> {
+    let mut cache = DESKTOP_INDEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let Some(current) = cache.as_mut() else {
+        let dirs = application_dirs();
+        let signature = dirs_signature(&dirs);
+        let index = Arc::new(DesktopIndex::load(&dirs));
+        *cache = Some(IndexCache {
+            signature,
+            index: Arc::clone(&index),
+            checked_at: Instant::now(),
+            reloading: false,
+        });
+        return index;
+    };
+
+    if !current.reloading && current.checked_at.elapsed() >= DESKTOP_INDEX_CHECK_INTERVAL {
+        current.checked_at = Instant::now();
+        let dirs = application_dirs();
+        let signature = dirs_signature(&dirs);
+        if signature != current.signature {
+            current.reloading = true;
+            thread::spawn(move || {
+                let index = Arc::new(DesktopIndex::load(&dirs));
+                let mut cache = DESKTOP_INDEX
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(current) = cache.as_mut() {
+                    current.signature = signature;
+                    current.index = index;
+                    current.reloading = false;
+                }
+            });
+        }
+    }
+
+    Arc::clone(&current.index)
+}
+
+fn application_dirs() -> Vec<PathBuf> {
+    data_dirs()
+        .into_iter()
+        .map(|dir| dir.join("applications"))
+        .collect()
+}
+
+fn data_dirs() -> Vec<PathBuf> {
+    let home = env::var_os("HOME").map(PathBuf::from);
+    let data_home = env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".local/share")));
+    let data_dirs = env::var("XDG_DATA_DIRS")
+        .ok()
+        .filter(|dirs| !dirs.trim().is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
+
+    // Flatpak and Snap export desktop files here; sessions started without
+    // their profile scripts miss them in XDG_DATA_DIRS.
+    let package_dirs = [
+        home.map(|home| home.join(".local/share/flatpak/exports/share")),
+        Some(PathBuf::from("/var/lib/flatpak/exports/share")),
+        Some(PathBuf::from("/var/lib/snapd/desktop")),
+    ];
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for dir in data_home
+        .into_iter()
+        .chain(
+            data_dirs
+                .split(':')
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from),
+        )
+        .chain(package_dirs.into_iter().flatten())
+    {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// Locale names to try for `Name[...]`, most specific first: `es_ES`, `es`.
+fn locale_names() -> Vec<String> {
+    let locale = ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .filter_map(|key| env::var(key).ok())
+        .find(|value| !value.is_empty())
+        .unwrap_or_default();
+    let base = locale
+        .split(['.', '@'])
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    if base.is_empty() || base == "C" || base == "POSIX" {
+        return Vec::new();
+    }
+
+    let mut names = vec![base.clone()];
+    if let Some((language, _)) = base.split_once('_') {
+        names.push(language.to_string());
+    }
+    names
+}
+
+fn parse_desktop_entry(id: &str, contents: &str, locale: &[String]) -> Option<DesktopEntry> {
+    let mut in_main_section = false;
+    let mut name = String::new();
+    let mut localized_name: Option<(usize, String)> = None;
+    let mut icon = String::new();
+    let mut wm_class = String::new();
+    let mut exec = String::new();
+    let mut no_display = false;
+
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_main_section = line == "[Desktop Entry]";
+            continue;
+        }
+        if !in_main_section {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let (key, value) = (key.trim(), value.trim());
+        match key {
+            "Name" => name = value.to_string(),
+            "Icon" => icon = value.to_string(),
+            "StartupWMClass" => wm_class = value.to_string(),
+            "Exec" => exec = exec_program(value),
+            "NoDisplay" => no_display = value == "true",
+            "Hidden" if value == "true" => return None,
+            "Type" if value != "Application" => return None,
+            _ => {
+                let Some(lang) = key
+                    .strip_prefix("Name[")
+                    .and_then(|rest| rest.strip_suffix(']'))
+                else {
+                    continue;
+                };
+                if let Some(priority) = locale.iter().position(|candidate| candidate == lang)
+                    && localized_name
+                        .as_ref()
+                        .is_none_or(|(best, _)| priority < *best)
+                {
+                    localized_name = Some((priority, value.to_string()));
+                }
+            }
+        }
+    }
+
+    if let Some((_, localized)) = localized_name {
+        name = localized;
+    }
+
+    (!name.is_empty() || !icon.is_empty()).then(|| DesktopEntry {
+        id: id.to_ascii_lowercase(),
+        name,
+        icon,
+        wm_class,
+        exec,
+        no_display,
+    })
+}
+
+/// Program basename from an `Exec=` line, skipping `env` and `VAR=value` prefixes.
+fn exec_program(exec: &str) -> String {
+    exec_arguments(exec)
+        .into_iter()
+        .find(|token| token != "env" && !token.contains('='))
+        .and_then(|program| {
+            Path::new(&program)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default()
+}
+
+/// Splits an `Exec=` value into arguments, honoring double quotes and the
+/// backslash escapes allowed inside them by the desktop entry spec.
+fn exec_arguments(exec: &str) -> Vec<String> {
+    let mut arguments = Vec::new();
+    let mut current = String::new();
+    let mut in_argument = false;
+    let mut in_quotes = false;
+    let mut chars = exec.chars();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                in_argument = true;
+            }
+            '\\' if in_quotes => {
+                if let Some(escaped) = chars.next() {
+                    current.push(escaped);
+                }
+            }
+            ch if ch.is_whitespace() && !in_quotes => {
+                if in_argument {
+                    arguments.push(std::mem::take(&mut current));
+                    in_argument = false;
+                }
+            }
+            ch => {
+                current.push(ch);
+                in_argument = true;
+            }
+        }
+    }
+    if in_argument {
+        arguments.push(current);
+    }
+    arguments
+}
+
+/// Desktop entry for a window: by class first, then by the process executable,
+/// which covers windows with a custom class (e.g. `alacritty --class foo`).
+fn window_desktop_entry<'a>(
+    index: &'a DesktopIndex,
+    class_name: &str,
+    exe: &str,
+) -> Option<&'a DesktopEntry> {
+    index
+        .lookup(class_name)
+        .or_else(|| is_specific_exe(exe).then(|| index.lookup(exe)).flatten())
+}
+
+/// Runtimes and wrappers say nothing about which app owns the window.
+fn is_specific_exe(exe: &str) -> bool {
+    const GENERIC: [&str; 8] = [
+        "electron", "python", "java", "node", "bwrap", "flatpak", "wine", "bash",
+    ];
+    !exe.is_empty() && !GENERIC.iter().any(|prefix| exe.starts_with(prefix))
+}
+
+fn process_exe_name(pid: i64) -> String {
+    if pid <= 0 {
+        return String::new();
+    }
+    fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default()
+}
+
+/// Icon names to try for a window, best guess first.
+fn icon_candidates(desktop_icon: &str, class_name: &str, exe: &str) -> Vec<String> {
+    let trimmed = class_name.trim();
+    let mut candidates = vec![desktop_icon.to_string()];
+    // Steam games: class `steam_app_<id>`, icon `steam_icon_<id>`.
+    if let Some(app_id) = trimmed.strip_prefix("steam_app_") {
+        candidates.push(format!("steam_icon_{app_id}"));
+    }
+    candidates.push(trimmed.to_string());
+    candidates.push(trimmed.to_ascii_lowercase());
+    candidates.push(class_tail(trimmed));
+    if is_specific_exe(exe) {
+        candidates.push(exe.to_string());
+    }
+    candidates.retain(|candidate| !candidate.is_empty());
+    candidates
+}
+
+fn window_icon(window: &WindowInfo) -> AppIcon {
+    let theme = gdk::Display::default().map(|display| gtk::IconTheme::for_display(&display));
+    icon_candidates(&window.desktop_icon, &window.wm_class, &window.exe)
+        .iter()
+        .find_map(|candidate| resolve_icon(candidate, theme.as_ref()))
+        .unwrap_or_else(|| AppIcon::Named("application-x-executable".to_string()))
+}
+
+/// Makes icons of every data dir visible to GTK, including Flatpak and Snap
+/// exports that the session's XDG_DATA_DIRS may not list.
+fn add_icon_search_paths() {
+    let Some(display) = gdk::Display::default() else {
+        return;
+    };
+    let theme = gtk::IconTheme::for_display(&display);
+    let known = theme.search_path();
+    for dir in data_dirs() {
+        let icons = dir.join("icons");
+        if icons.is_dir() && !known.contains(&icons) {
+            theme.add_search_path(&icons);
+        }
+    }
+}
+
+fn resolve_icon(icon: &str, theme: Option<&gtk::IconTheme>) -> Option<AppIcon> {
+    let path = Path::new(icon);
+    if path.is_absolute() {
+        return path.is_file().then(|| AppIcon::File(path.to_path_buf()));
+    }
+
+    // Some desktop files wrongly include an extension in a themed icon name.
+    let name = ["png", "svg", "xpm"]
+        .iter()
+        .find_map(|ext| icon.strip_suffix(&format!(".{ext}")))
+        .unwrap_or(icon);
+
+    let Some(theme) = theme else {
+        return Some(AppIcon::Named(name.to_string()));
+    };
+    if theme.has_icon(name) {
+        return Some(AppIcon::Named(name.to_string()));
+    }
+
+    data_dirs()
+        .into_iter()
+        .map(|dir| dir.join("pixmaps"))
+        .flat_map(|dir| ["png", "svg", "xpm"].map(|ext| dir.join(format!("{name}.{ext}"))))
+        .find(|candidate| candidate.is_file())
+        .map(AppIcon::File)
+}
+
+fn app_label(class_name: &str, entry: Option<&DesktopEntry>) -> String {
+    entry
+        .map(|entry| entry.name.clone())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            let class_name = class_name.trim();
+            if class_name.is_empty() {
+                "Application".to_string()
+            } else {
+                class_name.to_string()
+            }
+        })
 }
 
 fn clean_display_title(title: &str) -> String {
@@ -1171,6 +1667,8 @@ fn collect_windows(settings: ProfileSettings) -> Result<Vec<WindowInfo>> {
             .map(client_class)
     });
 
+    let desktop = desktop_index();
+
     let mut windows = clients
         .into_iter()
         .filter(|client| {
@@ -1198,10 +1696,17 @@ fn collect_windows(settings: ProfileSettings) -> Result<Vec<WindowInfo>> {
                 &client,
             );
 
+            let wm_class = resolved_class(client.wm_class, client.initial_class);
+            let exe = process_exe_name(client.pid);
+            let entry = window_desktop_entry(&desktop, &wm_class, &exe);
+
             WindowInfo {
                 address: client.address,
                 title: strip_markup(&client.title),
-                wm_class: resolved_class(client.wm_class, client.initial_class),
+                app_name: app_label(&wm_class, entry),
+                desktop_icon: entry.map(|entry| entry.icon.clone()).unwrap_or_default(),
+                wm_class,
+                exe,
                 workspace_id: client.workspace.id,
                 workspace_name: if client.workspace.name.is_empty() {
                     client.workspace.id.to_string()
@@ -1501,40 +2006,8 @@ where
         .with_context(|| format!("hyprctl {} returned invalid JSON", args.join(" ")))
 }
 
-fn send_or_start(command: IpcCommand, start_if_missing: bool) -> Result<()> {
-    match send_ipc(command) {
-        Ok(()) => Ok(()),
-        Err(first_err) if start_if_missing => {
-            let exe = env::current_exe().context("failed to resolve current executable")?;
-            Command::new(exe)
-                .arg("run")
-                .spawn()
-                .context("failed to auto-start switcher daemon")?;
-
-            for _ in 0..20 {
-                thread::sleep(Duration::from_millis(25));
-                if send_ipc(command).is_ok() {
-                    return Ok(());
-                }
-            }
-
-            Err(first_err).context("daemon was not reachable after auto-start")
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn send_ipc(command: IpcCommand) -> Result<()> {
-    let mut stream =
-        UnixStream::connect(socket_path()).context("switcher daemon is not running")?;
-    stream
-        .write_all(ipc_payload(command).as_bytes())
-        .context("failed to send IPC command")?;
-    Ok(())
-}
-
 fn spawn_ipc_listener(tx: mpsc::Sender<IpcCommand>) -> Result<()> {
-    let path = socket_path();
+    let path = ipc::socket_path().context("failed to resolve IPC socket path")?;
     if path.exists() {
         if UnixStream::connect(&path).is_ok() {
             bail!("another daemon is already listening on {}", path.display());
@@ -1548,73 +2021,28 @@ fn spawn_ipc_listener(tx: mpsc::Sender<IpcCommand>) -> Result<()> {
 
     thread::spawn(move || {
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else {
+            let Ok(stream) = stream else {
                 continue;
             };
-            let mut payload = String::new();
-            if stream.read_to_string(&mut payload).is_ok()
-                && let Some(command) = parse_ipc_payload(payload.trim())
-            {
-                let _ = tx.send(command);
-            }
+            // Read each client on its own thread, bounded in time and size, so a
+            // client that never closes its end cannot stall later commands.
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(IPC_READ_TIMEOUT));
+                let mut payload = String::new();
+                if stream
+                    .take(IPC_MAX_PAYLOAD)
+                    .read_to_string(&mut payload)
+                    .is_ok()
+                    && let Some(command) = IpcCommand::parse(&payload)
+                {
+                    let _ = tx.send(command);
+                }
+            });
         }
     });
 
     Ok(())
-}
-
-fn ipc_payload(command: IpcCommand) -> &'static str {
-    match command {
-        IpcCommand::Open(OpenRequest {
-            profile: Profile::Alt,
-            direction: Direction::Next,
-        }) => "open alt next\n",
-        IpcCommand::Open(OpenRequest {
-            profile: Profile::Alt,
-            direction: Direction::Prev,
-        }) => "open alt prev\n",
-        IpcCommand::Open(OpenRequest {
-            profile: Profile::Super,
-            direction: Direction::Next,
-        }) => "open super next\n",
-        IpcCommand::Open(OpenRequest {
-            profile: Profile::Super,
-            direction: Direction::Prev,
-        }) => "open super prev\n",
-        IpcCommand::Close => "close\n",
-        IpcCommand::Cancel => "cancel\n",
-    }
-}
-
-fn parse_ipc_payload(payload: &str) -> Option<IpcCommand> {
-    match payload {
-        "open next" | "open alt next" => Some(IpcCommand::Open(OpenRequest {
-            profile: Profile::Alt,
-            direction: Direction::Next,
-        })),
-        "open prev" | "open alt prev" => Some(IpcCommand::Open(OpenRequest {
-            profile: Profile::Alt,
-            direction: Direction::Prev,
-        })),
-        "open super next" => Some(IpcCommand::Open(OpenRequest {
-            profile: Profile::Super,
-            direction: Direction::Next,
-        })),
-        "open super prev" => Some(IpcCommand::Open(OpenRequest {
-            profile: Profile::Super,
-            direction: Direction::Prev,
-        })),
-        "close" => Some(IpcCommand::Close),
-        "cancel" => Some(IpcCommand::Cancel),
-        _ => None,
-    }
-}
-
-fn socket_path() -> PathBuf {
-    env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir)
-        .join(SOCKET_NAME)
 }
 
 fn install_css() {
@@ -1703,6 +2131,7 @@ mod tests {
             wm_class: "code".to_string(),
             initial_class: String::new(),
             title: "Code".to_string(),
+            pid: 0,
             focus_history_id: Some(0),
             pinned,
         }
@@ -1713,6 +2142,9 @@ mod tests {
             address: address.to_string(),
             title: "Code".to_string(),
             wm_class: "code".to_string(),
+            exe: String::new(),
+            app_name: "Visual Studio Code".to_string(),
+            desktop_icon: String::new(),
             workspace_id,
             workspace_name: workspace_id.to_string(),
             monitor: 1,
@@ -1866,45 +2298,6 @@ mod tests {
     }
 
     #[test]
-    fn ipc_payloads_round_trip() {
-        for command in [
-            IpcCommand::Open(OpenRequest {
-                profile: Profile::Alt,
-                direction: Direction::Next,
-            }),
-            IpcCommand::Open(OpenRequest {
-                profile: Profile::Alt,
-                direction: Direction::Prev,
-            }),
-            IpcCommand::Open(OpenRequest {
-                profile: Profile::Super,
-                direction: Direction::Next,
-            }),
-            IpcCommand::Open(OpenRequest {
-                profile: Profile::Super,
-                direction: Direction::Prev,
-            }),
-            IpcCommand::Close,
-            IpcCommand::Cancel,
-        ] {
-            assert_eq!(
-                parse_ipc_payload(ipc_payload(command).trim()).map(ipc_payload),
-                Some(ipc_payload(command))
-            );
-        }
-    }
-
-    #[test]
-    fn legacy_open_payloads_use_alt_profile() {
-        let Some(IpcCommand::Open(request)) = parse_ipc_payload("open next") else {
-            panic!("legacy payload did not parse");
-        };
-
-        assert_eq!(request.profile, Profile::Alt);
-        assert_eq!(request.direction, Direction::Next);
-    }
-
-    #[test]
     fn default_config_scopes_alt_and_super_to_current_monitor() {
         let config = AppConfig::default();
 
@@ -1955,6 +2348,28 @@ mod tests {
             ProfileSettings {
                 target: Target::Workspaces,
                 scope: Scope::CurrentMonitor,
+                same_class: false,
+                include_special_workspaces: false,
+                include_empty_workspaces: false,
+            }
+        );
+    }
+
+    #[test]
+    fn partial_super_config_keeps_workspace_target() {
+        let config = toml::from_str::<AppConfig>(
+            r#"
+            [super]
+            scope = "all"
+            "#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(
+            config.profile(Profile::Super),
+            ProfileSettings {
+                target: Target::Workspaces,
+                scope: Scope::All,
                 same_class: false,
                 include_special_workspaces: false,
                 include_empty_workspaces: false,
@@ -2087,6 +2502,178 @@ mod tests {
         assert_eq!(
             clean_display_title("one --- two -- three – four"),
             "one | two | three | four"
+        );
+    }
+
+    fn desktop_entry(id: &str, name: &str, wm_class: &str, exec: &str) -> DesktopEntry {
+        DesktopEntry {
+            id: id.to_ascii_lowercase(),
+            name: name.to_string(),
+            icon: format!("{}-icon", id.to_ascii_lowercase()),
+            wm_class: wm_class.to_string(),
+            exec: exec.to_string(),
+            no_display: false,
+        }
+    }
+
+    #[test]
+    fn desktop_entry_reads_main_section_only() {
+        let contents = "\
+[Desktop Entry]
+Type=Application
+Name=Claude
+Exec=claude-desktop %U
+Icon=claude-desktop
+StartupWMClass=com.anthropic.Claude
+
+[Desktop Action new-chat]
+Name=New chat
+Icon=other
+";
+        assert_eq!(
+            parse_desktop_entry("com.anthropic.Claude", contents, &[]),
+            Some(DesktopEntry {
+                id: "com.anthropic.claude".to_string(),
+                name: "Claude".to_string(),
+                icon: "claude-desktop".to_string(),
+                wm_class: "com.anthropic.Claude".to_string(),
+                exec: "claude-desktop".to_string(),
+                no_display: false,
+            })
+        );
+    }
+
+    #[test]
+    fn desktop_entry_prefers_most_specific_localized_name() {
+        let contents = "\
+[Desktop Entry]
+Name=Files
+Name[es]=Archivos
+Name[es_MX]=Archivos MX
+Name[fr]=Fichiers
+";
+        let locale = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        let name_for = |names: &[&str]| {
+            parse_desktop_entry("files", contents, &locale(names)).map(|entry| entry.name)
+        };
+        assert_eq!(name_for(&[]), Some("Files".to_string()));
+        assert_eq!(name_for(&["es_ES", "es"]), Some("Archivos".to_string()));
+        assert_eq!(name_for(&["es_MX", "es"]), Some("Archivos MX".to_string()));
+        assert_eq!(name_for(&["de_DE", "de"]), Some("Files".to_string()));
+    }
+
+    #[test]
+    fn desktop_entry_skips_hidden_and_non_application_entries() {
+        let hidden = "[Desktop Entry]\nName=Gone\nIcon=gone\nHidden=true\n";
+        assert_eq!(parse_desktop_entry("gone", hidden, &[]), None);
+        let link = "[Desktop Entry]\nType=Link\nName=Docs\nIcon=docs\n";
+        assert_eq!(parse_desktop_entry("docs", link, &[]), None);
+    }
+
+    #[test]
+    fn desktop_index_matches_by_class_id_tail_exec_and_name() {
+        let mut index = DesktopIndex::default();
+        index.insert(desktop_entry(
+            "com.anthropic.Claude",
+            "Claude",
+            "com.anthropic.Claude",
+            "claude-desktop",
+        ));
+        index.insert(desktop_entry("dev.zed.Zed", "Zed", "", "zed"));
+        index.insert(desktop_entry(
+            "spotify-launcher",
+            "Spotify",
+            "",
+            "spotify-launcher",
+        ));
+        index.insert(desktop_entry("org.example.Tool", "Tool", "", "tool-bin"));
+
+        let name_of = |class: &str| index.lookup(class).map(|entry| entry.name.as_str());
+        assert_eq!(name_of("com.anthropic.Claude"), Some("Claude"));
+        assert_eq!(name_of("dev.zed.Zed"), Some("Zed"));
+        assert_eq!(name_of("zed"), Some("Zed"));
+        assert_eq!(name_of("spotify-launcher"), Some("Spotify"));
+        assert_eq!(name_of("Spotify"), Some("Spotify"));
+        assert_eq!(name_of("tool-bin"), Some("Tool"));
+        assert_eq!(name_of("unknown"), None);
+        assert_eq!(name_of(""), None);
+    }
+
+    #[test]
+    fn desktop_index_fuzzy_keys_do_not_depend_on_insert_order() {
+        // Every Steam game desktop file has `Exec=steam steam://rungameid/...`.
+        let steam = desktop_entry("steam", "Steam", "", "steam");
+        let game = desktop_entry("Counter-Strike 2", "Counter-Strike 2", "", "steam");
+
+        for entries in [[steam.clone(), game.clone()], [game, steam]] {
+            let mut index = DesktopIndex::default();
+            for entry in entries {
+                index.insert(entry);
+            }
+            assert_eq!(index.by_exec["steam"].name, "Steam");
+        }
+    }
+
+    #[test]
+    fn user_desktop_files_override_and_hide_system_files() {
+        let root = env::temp_dir().join(format!("mogtab-test-{}", std::process::id()));
+        let user = root.join("user");
+        let system = root.join("system");
+        fs::create_dir_all(&user).unwrap();
+        fs::create_dir_all(&system).unwrap();
+
+        fs::write(
+            system.join("editor.desktop"),
+            "[Desktop Entry]\nName=Editor\nIcon=system-editor\n",
+        )
+        .unwrap();
+        fs::write(
+            user.join("editor.desktop"),
+            "[Desktop Entry]\nName=Editor\nIcon=user-editor\n",
+        )
+        .unwrap();
+        fs::write(
+            system.join("old.desktop"),
+            "[Desktop Entry]\nName=Old\nIcon=old\nStartupWMClass=old-app\n",
+        )
+        .unwrap();
+        fs::write(user.join("old.desktop"), "[Desktop Entry]\nHidden=true\n").unwrap();
+
+        let index = DesktopIndex::load(&[user, system]);
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(index.lookup("editor").unwrap().icon, "user-editor");
+        assert_eq!(index.lookup("old"), None);
+        assert_eq!(index.lookup("old-app"), None);
+    }
+
+    #[test]
+    fn steam_games_try_their_steam_icon() {
+        assert!(icon_candidates("", "steam_app_730", "").contains(&"steam_icon_730".to_string()));
+    }
+
+    #[test]
+    fn generic_runtimes_are_not_used_to_identify_apps() {
+        assert!(!is_specific_exe(""));
+        assert!(!is_specific_exe("electron36"));
+        assert!(!is_specific_exe("python3.13"));
+        assert!(is_specific_exe("alacritty"));
+    }
+
+    #[test]
+    fn exec_program_skips_env_and_arguments() {
+        assert_eq!(exec_program("claude-desktop %U"), "claude-desktop");
+        assert_eq!(exec_program("env FOO=1 /opt/app/bin/app --flag"), "app");
+        assert_eq!(exec_program("/usr/bin/zed %F"), "zed");
+        assert_eq!(exec_program("\"/opt/My App/bin/app\" %U"), "app");
+        assert_eq!(
+            exec_arguments(r#"sh -c "echo \"hi\" there" arg"#),
+            ["sh", "-c", "echo \"hi\" there", "arg"]
         );
     }
 }
